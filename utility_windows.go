@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
-	"github.com/DataDog/datadog-agent/pkg/util/winutil"
+	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"unsafe"
+
+	"github.com/DataDog/datadog-agent/pkg/util/winutil"
 
 	"github.com/gen2brain/beeep"
 	wapi "github.com/iamacarpet/go-win64api"
@@ -22,6 +26,8 @@ var (
 	kernel32DLL   = windows.NewLazyDLL("Kernel32.dll")
 	debuggerCheck = kernel32DLL.NewProc("IsDebuggerPresent")
 )
+
+const SECURITY_MAX_SID_SIZE = 68
 
 // readFile (Windows) uses ioutil's ReadFile function and passes the returned
 // byte sequence to decodeString.
@@ -65,7 +71,7 @@ func decodeString(fileContent string) (string, error) {
 	unicodeReader := transform.NewReader(bytes.NewReader(raw), utf16bom)
 
 	// Decode and print
-	decoded, err := ioutil.ReadAll(unicodeReader)
+	decoded, err := io.ReadAll(unicodeReader)
 	return string(decoded), err
 }
 
@@ -119,16 +125,76 @@ func adminCheck() bool {
 
 // sidToLocalUser takes an SID as a string and returns a string containing the
 // username of the Local User (NTAccount) that it belongs to.
-func sidToLocalUser(sid string) string {
-	cmdText := "$objSID = New-Object System.Security.Principal.SecurityIdentifier('" + sid + "'); $objUser = $objSID.Translate([System.Security.Principal.NTAccount]); Write-Host $objUser.Value"
-	output, _ := shellCommandOutput(cmdText)
-	return strings.TrimSpace(output)
+
+func sidToLocalUser(sid string) (string, error) {
+	// Convert SID string to SID object
+	sidPtr, err := windows.StringToSid(sid)
+	if err != nil {
+		return "", fmt.Errorf("failed to convert SID string to SID: %w", err)
+	}
+
+	// Get the account and domain name from the SID
+	var nameBuffer [256]uint16
+	var domainBuffer [256]uint16
+	var nameLen uint32 = uint32(len(nameBuffer))
+	var domainLen uint32 = uint32(len(domainBuffer))
+	var sidType uint32
+
+	err = windows.LookupAccountSid(
+		nil,                                 // Use the local system
+		sidPtr,                              // SID
+		&nameBuffer[0],                      // Name buffer
+		&nameLen,                            // Name length
+		&domainBuffer[0],                    // Domain buffer
+		&domainLen,                          // Domain length
+		(*uint32)(unsafe.Pointer(&sidType)), // SID type
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to look up account SID: %w", err)
+	}
+
+	// Combine the domain and account name
+	accountName := syscall.UTF16ToString(nameBuffer[:nameLen])
+	domainName := syscall.UTF16ToString(domainBuffer[:domainLen])
+	if domainName != "" {
+		return fmt.Sprintf("%s\\%s", domainName, accountName), nil
+	}
+	return accountName, nil
 }
 
 // localUserToSid takes a username as a string and returns a string containing
 // its SID. This is the opposite of sidToLocalUser.
 func localUserToSid(userName string) (string, error) {
-	return shellCommandOutput("$objUser = New-Object System.Security.Principal.NTAccount('" + userName + "'); $strSID = $objUser.Translate([System.Security.Principal.SecurityIdentifier]); Write-Host $strSID.Value")
+	// Convert username to UTF16 for Windows API
+	userNameUTF16, err := syscall.UTF16PtrFromString(userName)
+	if err != nil {
+		return "", fmt.Errorf("failed to convert username to UTF16: %w", err)
+	}
+
+	// Prepare buffers
+	var sid windows.SID
+	var sidLen uint32 = SECURITY_MAX_SID_SIZE
+	domainName := make([]uint16, 256)
+	var domainLen uint32 = uint32(len(domainName))
+	var sidType uint32
+	// LookupAccountName expects a raw SID buffer
+	err = windows.LookupAccountName(
+		nil, // local machine
+		userNameUTF16,
+		&sid, // pointer to the SID buffer
+		&sidLen,
+		&domainName[0],
+		&domainLen,
+		&sidType,
+	)
+	if err != nil {
+		return "", fmt.Errorf("LookupAccountName failed: %w", err)
+	}
+
+	// Convert SID to string
+	var sidString string = sid.String()
+
+	return sidString, nil
 }
 
 // getSecedit returns the string value of the secedit.exe command:

@@ -539,8 +539,14 @@ func (c cond) UserRights() (bool, error) {
 
 	privStringSplit = strings.Split(privStringSplit[2], ",")
 	for _, sidValue := range privStringSplit {
+
 		sidValue = strings.TrimSpace(sidValue)
-		userForSid := strings.Split(sidToLocalUser(sidValue[1:]), "\\")
+		sidString, err := sidToLocalUser(sidValue[1:])
+
+		if err != nil {
+			return false, err
+		}
+		userForSid := strings.Split(sidString, "\\")
 		userSid := strings.TrimSpace(userForSid[0])
 		if len(userForSid) == 2 {
 			userSid = strings.TrimSpace(userForSid[1])
